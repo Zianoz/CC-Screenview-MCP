@@ -4,16 +4,89 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createRequire } from "module";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { tmpdir } from "os";
+import { join } from "path";
+import { readFile, unlink } from "fs/promises";
 
-// screenshot-desktop is CommonJS — use createRequire for ESM compatibility
-const require = createRequire(import.meta.url);
-// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-const screenshotDesktop: (opts: { format: string }) => Promise<Buffer> =
-  require("screenshot-desktop");
+const execFileAsync = promisify(execFile);
+
+// ── Windows: PowerShell + System.Windows.Forms (no external deps) ──────────
+
+async function captureWindows(): Promise<Buffer> {
+  const tmpFile = join(tmpdir(), `cc_screenshot_${Date.now()}.png`);
+
+  // Use a PowerShell script to capture the primary screen
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$screen  = [System.Windows.Forms.Screen]::PrimaryScreen
+$bounds  = $screen.Bounds
+$bitmap  = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$gfx     = [System.Drawing.Graphics]::FromImage($bitmap)
+$gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+$bitmap.Save('${tmpFile.replace(/\\/g, "\\\\")}')
+$gfx.Dispose()
+$bitmap.Dispose()
+`.trim();
+
+  // Encode as UTF-16LE base64 to avoid quoting/escaping issues
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+
+  await execFileAsync("powershell", [
+    "-NonInteractive",
+    "-EncodedCommand",
+    encoded,
+  ]);
+
+  const buffer = await readFile(tmpFile);
+  await unlink(tmpFile).catch(() => {});
+  return buffer;
+}
+
+// ── Linux: try scrot → import (ImageMagick) → gnome-screenshot ────────────
+
+async function captureLinux(): Promise<Buffer> {
+  const tmpFile = join(tmpdir(), `cc_screenshot_${Date.now()}.png`);
+  const errors: string[] = [];
+
+  const backends: Array<{ cmd: string; args: string[] }> = [
+    { cmd: "scrot", args: [tmpFile] },
+    { cmd: "import", args: ["-window", "root", tmpFile] },
+    { cmd: "gnome-screenshot", args: ["-f", tmpFile] },
+  ];
+
+  for (const { cmd, args } of backends) {
+    try {
+      await execFileAsync(cmd, args);
+      const buffer = await readFile(tmpFile);
+      await unlink(tmpFile).catch(() => {});
+      return buffer;
+    } catch (e) {
+      errors.push(`  ${cmd}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  throw new Error(
+    `No screenshot backend found. Tried:\n${errors.join("\n")}\n\n` +
+      `Install one with:\n  sudo apt install scrot\n  # or: sudo apt install imagemagick`
+  );
+}
+
+// ── Dispatcher ─────────────────────────────────────────────────────────────
+
+async function captureScreen(): Promise<Buffer> {
+  if (process.platform === "win32") {
+    return captureWindows();
+  }
+  return captureLinux();
+}
+
+// ── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: "cc-screenview-mcp", version: "1.0.0" },
+  { name: "cc-screenview-mcp", version: "1.1.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -56,7 +129,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   try {
-    const imgBuffer = await screenshotDesktop({ format: "png" });
+    const imgBuffer = await captureScreen();
     const base64 = imgBuffer.toString("base64");
 
     return {
@@ -70,19 +143,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-
-    const hint =
-      process.platform === "linux"
-        ? "\n\nOn Linux, ensure a screenshot backend is installed:\n  sudo apt install scrot\n  # or: sudo apt install imagemagick"
-        : "";
-
     return {
-      content: [
-        {
-          type: "text",
-          text: `Failed to capture screenshot: ${message}${hint}`,
-        },
-      ],
+      content: [{ type: "text", text: `Screenshot failed:\n\n${message}` }],
       isError: true,
     };
   }

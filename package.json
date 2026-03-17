@@ -1,6 +1,6 @@
 {
   "name": "cc-screenview-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server that lets Claude Code capture and analyze screenshots",
   "type": "module",
   "main": "dist/index.js",
@@ -10,8 +10,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "screenshot-desktop": "^1.12.7"
+    "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
